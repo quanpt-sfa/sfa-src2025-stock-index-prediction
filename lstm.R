@@ -7,6 +7,7 @@ for (pkg in packages) {
   if (!(pkg %in% installed)) install.packages(pkg)
   library(pkg, character.only = TRUE)
 }
+tf <- tensorflow::tf
 #use_python("C:/Users/quanp/AppData/Local/Programs/Python/Python312/python.exe", required = TRUE)
 
 # Nếu bạn đã cài Python và tensorflow từ trước, có thể khai báo rõ:
@@ -148,8 +149,8 @@ if (requireNamespace("keras", quietly = TRUE) && keras::is_keras_available()) {
   history <- model_lstm$fit(
     x = X,
     y = y,
-    epochs = 50,
-    batch_size = 16,
+    epochs = 50L,
+    batch_size = 16L,
     verbose = 0
   )
   
@@ -159,7 +160,7 @@ if (requireNamespace("keras", quietly = TRUE) && keras::is_keras_available()) {
   forecast_horizon <- as.integer(nrow(test_data))
   for (i in 1:forecast_horizon) {
     input_seq <- array(last_sequence, dim = c(1, 10, 1))
-    pred <- model_lstm %>% predict(input_seq)
+    pred <- as.numeric(model_lstm$predict(input_seq))
     preds_scaled[i] <- pred
     last_sequence <- c(last_sequence[-1], pred)
   }
@@ -168,138 +169,149 @@ if (requireNamespace("keras", quietly = TRUE) && keras::is_keras_available()) {
   results[["LSTM"]] <- preds
 }
 
-#############################
-# 7.1. Triển khai mô hình LSTM-LWR
-#############################
+library(keras)
+library(tensorflow)
 
-# Hàm DLWR sử dụng LWR thông qua loess()
+#########################
+# 1. Hàm phân tách DLWR
+#########################
 DLWR_decompose <- function(R, spans = c(0.3, 0.3, 0.3), degree = 2) {
-  # R: vector dữ liệu gốc
-  # spans: vector chứa các giá trị span cho 3 lần tách
-  # degree: bậc polynomial cho loess (1 hoặc 2)
   n <- length(R)
   t <- seq_len(n)
-  
-  # Lần tách 1: R = f0 + d0
   fit_f0 <- loess(R ~ t, span = spans[1], degree = degree)
   f0 <- predict(fit_f0, newdata = data.frame(t = t))
   d0 <- R - f0
-  
-  # Lần tách 2: d0 = f1 + d1
   fit_f1 <- loess(d0 ~ t, span = spans[2], degree = degree)
   f1 <- predict(fit_f1, newdata = data.frame(t = t))
   d1 <- d0 - f1
-  
-  # Lần tách 3: d1 = f2 + d2
   fit_f2 <- loess(d1 ~ t, span = spans[3], degree = degree)
   f2 <- predict(fit_f2, newdata = data.frame(t = t))
   d2 <- d1 - f2
-  
-  # Trả về các thành phần sao cho R ≈ f0 + f1 + f2 + d2
   return(list(f0 = f0, f1 = f1, f2 = f2, d2 = d2))
 }
 
-# Sử dụng cột giá trị đóng cửa của VN-Index từ tập huấn luyện (training_data)
-raw_series <- as.numeric(training_data$vnindex_close)
-decomp <- DLWR_decompose(raw_series, spans = c(0.3, 0.3, 0.3), degree = 2)
-
-# (Tùy chọn) Vẽ biểu đồ các thành phần DLWR để kiểm tra
-plot(raw_series, type = "l", col = "black", lwd = 2, 
-     main = "Phân tách DLWR", xlab = "Thời gian", ylab = "Giá trị")
-lines(decomp$f0, col = "blue", lwd = 2)
-lines(decomp$f1, col = "green", lwd = 2)
-lines(decomp$f2, col = "red", lwd = 2)
-lines(decomp$d2, col = "purple", lwd = 2)
-legend("topleft", legend = c("Raw", "f0", "f1", "f2", "d2"),
-       col = c("black", "blue", "green", "red", "purple"), lty = 1, lwd = 2)
-
-#############################
-# 7.2. Huấn luyện LSTM cho thành phần f2 (thành phần xu hướng thứ ba)
-#############################
-# Chọn thành phần f2 để dự báo
-f2 <- decomp$f2
-
-# Chuẩn hóa f2 về khoảng [0, 1] (MinMaxScaler)
-f2_min <- min(f2, na.rm = TRUE)
-f2_max <- max(f2, na.rm = TRUE)
-f2_scaled <- (f2 - f2_min) / (f2_max - f2_min)
-
-# Tạo dữ liệu dạng chuỗi cho LSTM: sử dụng 'lag' bước làm input
-lag <- 10  # số bước thời gian (window) cho input
-num_samples <- length(f2_scaled) - lag
-X <- array(NA, dim = c(num_samples, lag, 1))
-y <- array(NA, dim = c(num_samples))
-for (i in 1:num_samples) {
-  X[i, , 1] <- f2_scaled[i:(i + lag - 1)]
-  y[i] <- f2_scaled[i + lag]
+#########################
+# 2. Tiện ích hỗ trợ
+#########################
+scale_minmax <- function(x) {
+  min_x <- min(x, na.rm = TRUE)
+  max_x <- max(x, na.rm = TRUE)
+  scaled <- (x - min_x) / (max_x - min_x)
+  list(scaled = scaled, min = min_x, max = max_x)
 }
 
-# Kiểm tra gói keras đã được cài đặt và khả dụng chưa
-if(requireNamespace("keras", quietly = TRUE) && keras::is_keras_available()){
-  library(keras)
+create_lstm_data <- function(series, lag = 10L) {
+  n <- length(series)
+  num_samples <- n - lag
+  X <- array(NA, dim = c(num_samples, lag, 1))
+  y <- array(NA, dim = c(num_samples))
+  for (i in 1:num_samples) {
+    X[i, , 1] <- series[i:(i + lag - 1)]
+    y[i] <- series[i + lag]
+  }
+  list(X = X, y = y)
+}
+
+build_lstm_model <- function(input_shape = c(10L, 1L)) {
+  model <- keras_model_sequential()
+  model$add(layer_lstm(units = 64, input_shape = input_shape, return_sequences = TRUE))
+  model$add(layer_lstm(units = 128, return_sequences = TRUE))
+  model$add(layer_lstm(units = 128))
+  model$add(layer_dense(units = 128, activation = "relu"))
+  model$add(layer_dropout(rate = 0.2))
+  model$add(layer_dense(units = 1, activation = "relu"))
+  return(model)
+}
+
+
+
+train_predict_lstm <- function(scaled_series, lag = 10L, horizon = 30L, epochs = 100, batch_size = 32) {
+  data <- create_lstm_data(scaled_series, lag)
+  X <- data$X
+  y <- data$y
   
-  # Xây dựng mô hình LSTM
-  model_lstm_lwr <- keras_model_sequential() %>%
-    layer_lstm(units = 50, input_shape = c(lag, 1)) %>%
-    layer_dense(units = 1)
-  
-  model_lstm_lwr %>% compile(
+  model <- build_lstm_model(input_shape = c(lag, 1))
+  model$compile(
     loss = "mean_squared_error",
-    optimizer = "adam"
+    optimizer = keras$optimizers$Adam()
   )
   
-  # Huấn luyện mô hình LSTM cho f2
-  model_lstm_lwr %>% fit(X, y, epochs = 50, batch_size = 16, verbose = 1)
+  early_stop <- callback_early_stopping(
+    monitor = "loss",
+    patience = 10,
+    restore_best_weights = TRUE
+  )
   
-  #############################
-  # 7.3. Dự báo tương lai cho f2 bằng mô hình LSTM
-  #############################
-  forecast_horizon <- nrow(test_data)  # số bước dự báo bằng độ dài của tập kiểm tra
-  last_seq <- tail(f2_scaled, lag)
-  preds_scaled <- numeric(forecast_horizon)
+  model$fit(
+    x = X,
+    y = y,
+    epochs = 100L,
+    batch_size = 32L,
+    callbacks = list(early_stop)
+  )
   
-  for(i in 1:forecast_horizon){
-    input_seq <- array(last_seq, dim = c(1, lag, 1))
-    pred <- model_lstm_lwr %>% predict(input_seq)
-    preds_scaled[i] <- pred
-    # Cập nhật chuỗi: loại bỏ giá trị đầu tiên và thêm dự báo mới
+  preds <- numeric(horizon)
+  last_seq <- tail(scaled_series, lag)
+  for (i in 1:horizon) {
+    input_seq <- array(last_seq, dim = c(1L, lag, 1L))
+    input_seq <- tf$cast(input_seq, dtype = tf$float32)
+    pred <- as.numeric(model$predict(input_seq))
+    preds[i] <- pred
     last_seq <- c(last_seq[-1], pred)
   }
   
-  # Khôi phục dự báo f2 về thang đo ban đầu
-  preds_f2 <- preds_scaled * (f2_max - f2_min) + f2_min
-  
-  #############################
-  # 7.4. Dự báo các thành phần khác (f0, f1, d2) và tổng hợp lại kết quả cuối cùng
-  #############################
-  # Ở đây, ví dụ dùng giá trị cuối quan sát làm dự báo cho f0, f1 và d2
-  forecast_f0 <- rep(tail(decomp$f0, 1), forecast_horizon)
-  forecast_f1 <- rep(tail(decomp$f1, 1), forecast_horizon)
-  forecast_d2 <- rep(tail(decomp$d2, 1), forecast_horizon)
-  
-  # Kết hợp các dự báo: dự báo cuối cùng cho R = f0 + f1 + f2 (dự báo từ LSTM) + d2
-  final_forecast <- forecast_f0 + forecast_f1 + preds_f2 + forecast_d2
-  
-  #############################
-  # 7.5. Vẽ biểu đồ dự báo so với dữ liệu thực tế
-  #############################
-  actual <- as.numeric(test_data$vnindex_close)
-  forecast_dates <- index(test_data)
-  
-  plot(forecast_dates, actual, type = "l", col = "blue", lwd = 2,
-       main = "Dự báo LSTM-LWR vs Thực tế",
-       xlab = "Ngày", ylab = "VN-Index",
-       ylim = range(c(actual, final_forecast)))
-  lines(forecast_dates, final_forecast, col = "red", lwd = 2)
-  legend("topleft", legend = c("Thực tế", "LSTM-LWR Dự báo"),
-         col = c("blue", "red"), lty = 1, lwd = 2)
-  
-  # Lưu kết quả dự báo vào danh sách results (nếu bạn đã dùng biến results ở các mô hình khác)
-  results[["LSTM_LWR"]] <- final_forecast
-  
-} else {
-  cat("Keras chưa khả dụng. Vui lòng cài đặt và cấu hình keras (với TensorFlow) để chạy mô hình LSTM-LWR.\n")
+  return(preds)
 }
+
+#########################
+# 3. Bắt đầu triển khai mô hình DLWR-LSTM
+#########################
+
+# Dữ liệu đầu vào
+raw_series <- as.numeric(training_data$vnindex_close)
+decomp <- DLWR_decompose(raw_series, spans = c(0.3, 0.3, 0.3), degree = 2)
+
+# Số bước dự báo
+forecast_horizon <- as.integer(nrow(test_data))
+
+# Khởi tạo danh sách kết quả
+preds_components <- list()
+
+# Huấn luyện và dự báo từng thành phần DLWR bằng LSTM riêng
+for (name in c("f0", "f1", "f2", "d2")) {
+  comp <- decomp[[name]]
+  scaled <- scale_minmax(comp)
+  pred_scaled <- train_predict_lstm(
+    scaled_series = scaled$scaled,
+    lag = 10L,
+    horizon = forecast_horizon,
+    epochs = 100,
+    batch_size = 32
+  )
+  preds_components[[name]] <- pred_scaled * (scaled$max - scaled$min) + scaled$min
+}
+
+# Tổng hợp dự báo cuối cùng
+final_forecast <- preds_components$f0 + preds_components$f1 + preds_components$f2 + preds_components$d2
+
+#########################
+# 4. Vẽ kết quả so với thực tế
+#########################
+
+actual <- as.numeric(test_data$vnindex_close)
+forecast_dates <- index(test_data)
+
+plot(forecast_dates, actual, type = "l", col = "blue", lwd = 2,
+     main = "Dự báo DLWR-LSTM với 4 thành phần",
+     xlab = "Ngày", ylab = "VN-Index",
+     ylim = range(c(actual, final_forecast)))
+lines(forecast_dates, final_forecast, col = "red", lwd = 2)
+legend("topleft", legend = c("Thực tế", "DLWR-LSTM Dự báo"),
+       col = c("blue", "red"), lty = 1, lwd = 2)
+
+# Lưu kết quả
+results[["LSTM_LWR"]] <- final_forecast
+
 
 
 ###########################
