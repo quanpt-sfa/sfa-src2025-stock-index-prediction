@@ -7,11 +7,12 @@ for (pkg in packages) {
   if (!(pkg %in% installed)) install.packages(pkg)
   library(pkg, character.only = TRUE)
 }
+#use_python("C:/Users/quanp/AppData/Local/Programs/Python/Python312/python.exe", required = TRUE)
 
 # Nếu bạn đã cài Python và tensorflow từ trước, có thể khai báo rõ:
 # library(reticulate)
 # use_python("C:/Users/quanp/AppData/Local/Programs/Python/Python312/python.exe", required = TRUE)
-
+#install_keras(tensorflow = "2.16.1")
 ###########################
 # 2. Đọc và xử lý dữ liệu
 ###########################
