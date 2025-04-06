@@ -1,7 +1,7 @@
 ###########################
 # 1. Cài đặt và nạp các gói cần thiết
 ###########################
-packages <- c("readxl", "xts", "zoo", "tseries", "rugarch", "forecast", "FinTS")
+packages <- c("readxl", "xts", "zoo", "tseries", "rugarch", "forecast", "FinTS","Rlibeemd","torch")
 installed <- rownames(installed.packages())
 for (pkg in packages) {
   if (!(pkg %in% installed)) install.packages(pkg)
@@ -116,58 +116,196 @@ for (name in names(models)[-1]) {
 ###########################
 # 7. Xây và huấn luyện mô hình LSTM (nếu khả dụng)
 ###########################
-price_train <- as.numeric(training_data$vnindex_close)
-price_test <- as.numeric(test_data$vnindex_close)
-price_scaled <- scale(price_train)
-n_samples <- as.integer(length(price_scaled) - 10)
-X <- array(NA, dim = c(n_samples, 10L, 1L))
-y <- array(NA, dim = c(n_samples))
-for (i in 1:n_samples) {
-  X[i, , 1] <- as.numeric(price_scaled[i:(i+9)])
-  y[i] <- as.numeric(price_scaled[i+10])
+device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
+cat("Thiết bị đang dùng:", device$type, "\n")
+
+# ------------------------------
+# 1. Dữ liệu & CEEMDAN phân rã
+# ------------------------------
+raw_series <- as.numeric(training_data$vnindex_close)
+forecast_horizon <- as.integer(nrow(test_data))
+imfs <- ceemdan(raw_series, ensemble_size = 250L, noise_strength = 0.2)
+num_imfs <- min(nrow(imfs), 6)  # Giới hạn số IMFs để tăng hiệu năng
+
+# ------------------------------
+# 2. Hàm chuẩn hóa MinMax
+# ------------------------------
+scale_minmax <- function(x) {
+  min_x <- min(x, na.rm = TRUE)
+  max_x <- max(x, na.rm = TRUE)
+  range <- max_x - min_x
+  if (range == 0) range <- 1
+  scaled <- (x - min_x) / range
+  list(scaled = scaled, min = min_x, max = max_x)
 }
 
-if (requireNamespace("keras", quietly = TRUE) && keras::is_keras_available()) {
-  library(keras)
-  
-  # Định nghĩa input layer
-  input <- layer_input(shape = c(10, 1))
-  
-  # Xây dựng các layer kế tiếp bằng cách nối với input
-  output <- input %>%
-    layer_lstm(units = 50, return_sequences = FALSE) %>%
-    layer_dense(units = 1)
-  
-  # Tạo mô hình từ input và output
-  model_lstm <- keras_model(inputs = input, outputs = output)
-  
-  model_lstm$compile(
-    loss = "mean_squared_error",
-    optimizer = optimizer_adam()
-  )
-  
-  history <- model_lstm$fit(
-    x = X,
-    y = y,
-    epochs = 50L,
+# ------------------------------
+# 3. Chuẩn bị dữ liệu LSTM
+# ------------------------------
+create_lstm_data <- function(series, lag = 10L) {
+  X <- list()
+  y <- c()
+  for (i in 1:(length(series) - lag)) {
+    X[[i]] <- series[i:(i + lag - 1)]
+    y[i] <- series[i + lag]
+  }
+  X_array <- array(unlist(X), dim = c(length(X), lag, 1))
+  y_array <- y
+  X_tensor <- torch_tensor(X_array, dtype = torch_float())$to(device = device)
+  y_tensor <- torch_tensor(y_array, dtype = torch_float())$to(device = device)
+  list(X = X_tensor, y = y_tensor)
+}
+
+# ------------------------------
+# 4. Mô hình LSTM đơn giản
+# ------------------------------
+lstm_model <- nn_module(
+  initialize = function() {
+    self$lstm <- nn_lstm(input_size = 1, hidden_size = 32, batch_first = TRUE)
+    self$fc <- nn_linear(32, 1)
+  },
+  forward = function(x) {
+    out <- self$lstm(x)[[1]]
+    last <- out[ , dim(out)[2], ]
+    self$fc(last)
+  }
+)
+
+# ------------------------------
+# 5. Huấn luyện và dự báo 1 IMF
+# ------------------------------
+train_predict_lstm <- function(
+    scaled_series,
+    lag = 10L,
+    horizon = 30L,
+    epochs = 100L,
     batch_size = 16L,
-    verbose = 0
-  )
+    early_stopping_patience = 10,
+    min_delta = 1e-5,
+    verbose = TRUE
+) {
+  # 1. Tạo dữ liệu huấn luyện
+  data <- create_lstm_data(scaled_series, lag)
+  X <- data$X
+  y <- data$y
   
-  # Dự báo
-  last_sequence <- tail(price_scaled, 10)
-  preds_scaled <- numeric(forecast_horizon)
-  forecast_horizon <- as.integer(nrow(test_data))
-  for (i in 1:forecast_horizon) {
-    input_seq <- array(last_sequence, dim = c(1, 10, 1))
-    pred <- as.numeric(model_lstm$predict(input_seq))
-    preds_scaled[i] <- pred
-    last_sequence <- c(last_sequence[-1], pred)
+  # 2. Khởi tạo mô hình và tối ưu
+  model <- lstm_model()
+  model$to(device = device)
+  optimizer <- optim_adam(model$parameters, lr = 0.001)
+  loss_fn <- nn_mse_loss()
+  
+  best_loss <- Inf
+  patience_counter <- 0
+  
+  # 3. Huấn luyện mô hình
+  for (epoch in 1:epochs) {
+    model$train()
+    optimizer$zero_grad()
+    
+    output <- model(X)
+    output <- output$view(c(-1))  # chuyển về vector cùng shape với y
+    
+    loss <- loss_fn(output, y)
+    loss$backward()
+    
+    nn_utils_clip_grad_norm_(model$parameters, max_norm = 1.0)
+    optimizer$step()
+    
+    current_loss <- loss$item()
+    if (verbose && epoch %% 10 == 0) {
+      cat(sprintf("Epoch %d: loss = %.6f\n", epoch, current_loss))
+    }
+    
+    if (best_loss - current_loss > min_delta) {
+      best_loss <- current_loss
+      patience_counter <- 0
+    } else {
+      patience_counter <- patience_counter + 1
+    }
+    
+    if (patience_counter >= early_stopping_patience) {
+      if (verbose) cat("Early stopping tại epoch", epoch, "\n")
+      break
+    }
   }
   
-  preds <- preds_scaled * attr(price_scaled, 'scaled:scale') + attr(price_scaled, 'scaled:center')
-  results[["LSTM"]] <- preds
+  # 4. Dự báo chuỗi tương lai
+  model$eval()
+  preds <- numeric(horizon)
+  last_seq <- tail(scaled_series, lag)
+  
+  for (i in 1:horizon) {
+    last_seq <- as.numeric(last_seq)
+    
+    if (length(last_seq) != lag) {
+      stop("Lỗi: Độ dài chuỗi không đúng tại bước ", i)
+    }
+    
+    if (any(!is.finite(last_seq))) {
+      stop("Lỗi: Chuỗi chứa giá trị không hợp lệ tại bước ", i)
+    }
+    
+    input_array <- array(last_seq, dim = c(1, lag, 1))
+    mode(input_array) <- "numeric"
+    
+    if (typeof(input_array) != "double") {
+      stop("Lỗi: input_array không phải kiểu double tại bước ", i)
+    }
+    
+    input_tensor <- tryCatch({
+      torch_tensor(input_array, dtype = torch_float())$to(device = device)
+    }, error = function(e) {
+      stop("Lỗi khi tạo tensor tại bước ", i, ": ", conditionMessage(e))
+    })
+    
+    pred <- as.numeric(model(input_tensor)$item())
+    
+    if (!is.finite(pred)) {
+      stop("Lỗi: Dự báo không hợp lệ tại bước ", i)
+    }
+    
+    preds[i] <- pred
+    last_seq <- c(last_seq[-1], pred)
+  }
+  
+  # 5. Giải phóng bộ nhớ GPU nếu cần
+  rm(model)
+  gc()
+  torch::cuda_empty_cache()
+  
+  return(preds)
 }
+
+
+
+# ------------------------------
+# 6. Huấn luyện từng IMF và tổng hợp
+# ------------------------------
+preds_components <- list()
+for (i in 1:num_imfs) {
+  cat("📦 Dự báo IMF", i, "\n")
+  comp <- imfs[i, ]
+  scaled <- scale_minmax(comp)
+  pred_scaled <- train_predict_lstm(
+    scaled_series = scaled$scaled,
+    lag = 10L,
+    horizon = forecast_horizon,
+    epochs = 50
+  )
+  
+  # Phục hồi thang đo ban đầu
+  pred_unscaled <- pred_scaled * (scaled$max - scaled$min) + scaled$min
+  preds_components[[paste0("IMF", i)]] <- pred_unscaled
+}
+
+# ------------------------------
+# 7. Tổng hợp dự báo cuối cùng
+# ------------------------------
+final_forecast <- Reduce("+", preds_components)
+results[["CEEMDAN_LSTM"]] <- final_forecast
+
+
 
 library(keras)
 library(tensorflow)
@@ -314,6 +452,139 @@ results[["LSTM_LWR"]] <- final_forecast
 
 
 
+library(torch)
+library(Rlibeemd)
+
+# 1. Dữ liệu và thiết lập
+raw_series <- as.numeric(training_data$vnindex_close)
+forecast_horizon <- as.integer(nrow(test_data))
+
+# 2. CEEMDAN phân rã chuỗi
+imfs <- ceemdan(raw_series, ensemble_size = 250L, noise_strength = 0.2)
+num_imfs <- nrow(imfs)
+max_imfs <- min(num_imfs, 6)  # chỉ dùng 6 IMF đầu
+preds_components <- list()
+
+# 3. Scale MinMax
+scale_minmax <- function(x) {
+  min_x <- min(x, na.rm = TRUE)
+  max_x <- max(x, na.rm = TRUE)
+  scaled <- (x - min_x) / (max_x - min_x)
+  list(scaled = scaled, min = min_x, max = max_x)
+}
+
+# 4. Tạo dữ liệu cho LSTM
+create_lstm_data <- function(series, lag = 10L) {
+  n <- length(series)
+  X <- list()
+  y <- c()
+  for (i in 1:(n - lag)) {
+    X[[i]] <- series[i:(i + lag - 1)]
+    y[i] <- series[i + lag]
+  }
+  X_tensor <- torch_tensor(array(unlist(X), dim = c(length(X), lag, 1)), dtype = torch_float())
+  y_tensor <- torch_tensor(y, dtype = torch_float())
+  list(X = X_tensor, y = y_tensor)
+}
+
+# 5. Mô hình LSTM
+lstm_model <- nn_module(
+  initialize = function() {
+    self$lstm1 <- nn_lstm(input_size = 1, hidden_size = 64, batch_first = TRUE)
+    self$lstm2 <- nn_lstm(input_size = 64, hidden_size = 128, batch_first = TRUE)
+    self$fc1 <- nn_linear(128, 64)
+    self$drop <- nn_dropout(p = 0.2)
+    self$fc2 <- nn_linear(64, 1)
+  },
+  forward = function(x) {
+    x <- self$lstm1(x)[[1]]
+    x <- self$lstm2(x)[[1]]
+    x <- x[ , dim(x)[2], ]
+    x <- nnf_relu(self$fc1(x))
+    x <- self$drop(x)
+    self$fc2(x)
+  }
+)
+
+# 6. Huấn luyện LSTM trên từng IMF
+train_predict_lstm_torch <- function(scaled_series, lag = 10L, horizon = 30L,
+                                     epochs = 30, batch_size = 16, device = torch_device("cpu")) {
+  data <- create_lstm_data(scaled_series, lag)
+  X <- data$X$to(device = device)
+  y <- data$y$to(device = device)
+  
+  model <- lstm_model()
+  model$to(device = device)
+  
+  optimizer <- optim_adam(model$parameters, lr = 0.01)
+  loss_fn <- nn_mse_loss()
+  
+  for (epoch in 1:epochs) {
+    model$train()
+    optimizer$zero_grad()
+    pred <- model(X)$squeeze()
+    loss <- loss_fn(pred, y)
+    loss$backward()
+    optimizer$step()
+    if (epoch %% 10 == 0) cat(sprintf("Epoch %d - Loss: %.6f\n", epoch, loss$item()))
+  }
+  
+  # Dự báo
+  preds <- c()
+  last_seq <- tail(scaled_series, lag)
+  model$eval()
+  for (i in 1:horizon) {
+    input <- torch_tensor(array(last_seq, dim = c(1, lag, 1)), dtype = torch_float())$to(device = device)
+    pred <- model(input)
+    pred_val <- as.numeric(pred$item())
+    preds[i] <- pred_val
+    last_seq <- c(last_seq[-1], pred_val)
+  }
+  
+  rm(model); gc(); torch::cuda_empty_cache()
+  return(preds)
+}
+
+# 7. Dự báo lần lượt 6 IMF đầu
+device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
+for (i in 1:max_imfs) {
+  cat(sprintf("🧠 Huấn luyện IMF %d / %d\n", i, max_imfs))
+  comp <- imfs[i, ]
+  scaled <- scale_minmax(comp)
+  pred_scaled <- train_predict_lstm_torch(
+    scaled_series = scaled$scaled,
+    lag = 10L,
+    horizon = forecast_horizon,
+    epochs = 30,
+    batch_size = 16,
+    device = device
+  )
+  preds_components[[i]] <- pred_scaled * (scaled$max - scaled$min) + scaled$min
+}
+
+# 8. Tổng hợp dự báo
+final_forecast <- Reduce(`+`, preds_components)
+
+# 9. Vẽ kết quả
+actual <- as.numeric(test_data$vnindex_close)
+forecast_dates <- index(test_data)
+
+plot(forecast_dates, actual, type = "l", col = "blue", lwd = 2,
+     main = "CEEMDAN-LSTM torch (6 IMF)",
+     xlab = "Ngày", ylab = "VN-Index",
+     ylim = range(c(actual, final_forecast)))
+lines(forecast_dates, final_forecast, col = "red", lwd = 2)
+legend("topleft", legend = c("Thực tế", "CEEMDAN-LSTM (6 IMF)"),
+       col = c("blue", "red"), lwd = 2)
+
+# 10. Lưu kết quả
+results[["CEEMDAN_LSTM_6IMF"]] <- final_forecast
+
+
+
+
+
+
 ###########################
 # 8. Vẽ biểu đồ với tất cả mô hình
 ###########################
@@ -327,10 +598,6 @@ lines(forecast_dates, results[["GARCH"]], col="black", lwd=2, lty=5)
 lines(forecast_dates, results[["ARIMA_GARCH"]], col="darkorange", lwd=2, lty=2)
 lines(forecast_dates, results[["ARIMA_EGARCH"]], col="purple", lwd=2, lty=3)
 lines(forecast_dates, results[["ARIMA_GJR_GARCH"]], col="green", lwd=2, lty=4)
-if ("LSTM" %in% names(results)) {
-  lines(forecast_dates, results[["LSTM"]], col="red", lwd=2, lty=6)
-  
-}
 
 if ("LSTM_DLWR" %in% names(results)) {
   lines(forecast_dates, results[["LSTM_DLWR"]], col="magenta", lwd=2, lty=7)
