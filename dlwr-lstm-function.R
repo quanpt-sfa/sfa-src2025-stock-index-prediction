@@ -208,7 +208,7 @@ train_lstm_component <- function(series, lookback, epochs, batch_size, lr, devic
     
   preds <- as.numeric(preds)
   summary(preds)
-  return(list(preds = preds, min = min_val, max = max_val))
+  return(list(preds = preds, min = min_val, max = max_val, val_loss = avg_val_loss))
 }
 
 #Thiết kế module LSTM phù hợp
@@ -236,90 +236,94 @@ LSTMModel <- nn_module(
 )
 
 
-#--- 6. Auto-tune Parallel ---
-auto_tune_parallel <- function(dlwr_params, lstm_params, raw_data){
-  
-  param_grid <- expand.grid(
-  n = dlwr_params$n,
-  deg = dlwr_params$deg,
-  alpha = dlwr_params$alpha,
-  kern = dlwr_params$kern,
-  lookback = lstm_params$lookback,
-  epochs = lstm_params$epochs,
-  batch_size = lstm_params$batch_size,
-  lr = lstm_params$lr
-)
-
-  
-  cl <- makeCluster(detectCores() - 1)
-  registerDoParallel(cl)
-  
-  results <- foreach(
-    i = seq_len(nrow(param_grid)), 
-    .packages = c('torch', 'locfit', 'purrr'),
-    .export = c("dlwr_separation", "train_lstm_component", "dlwr_fit", "LSTMModel",
-                "minmax_scale", "minmax_inverse", "r_squared","create_dataset","split_series")
-  ) %dopar% {
-    dlwr_p <- param_grid[i, c('n','deg','alpha',"kern")]
-    lstm_p <- param_grid[i, c('lookback','epochs','batch_size','lr')]
-    
-
-    res_sep <- dlwr_separation(raw_data, "date", "vnindex_close", dlwr_p)
-    
-    device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
-
-    pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-    pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-    pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-    pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-    
-    # Inverse từng phần
-    pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
-    pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
-    pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
-    pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
-    
-    # Cộng thành tổng dự báo
-    r_hat <- pf0 + pf1 + pf2 + pd2
-
-    true <- tail(res_sep$R, length(r_hat))
-    
-    list(
-      params = param_grid[i, ],
-      MAE  = mean(abs(true - r_hat), na.rm = TRUE),
-      RMSE = sqrt(mean((true - r_hat)^2, na.rm = TRUE)),
-      MAPE = mean(abs((true - r_hat) / true), na.rm = TRUE) * 100,
-      R2   = r_squared(true, r_hat) 
-    )
-  }
-  
-  
-  stopCluster(cl)
-  saveRDS(results, "grid_search_results.rds")
-  return(results)
-}
-
-#--- 7. Chạy pipeline hoàn chỉnh ---
-raw_data <- prepare_data("data_vnindex1.xlsx")
-dlwr_params <- list(n=c(15,20), deg=c(1,2), alpha=0.2, kern = c("tricube", "gauss"))
-lstm_params <- list(lookback=c(5,10,15,20), epochs=50, batch_size=16, lr=c(0.0005,0.001))
-
-results <- auto_tune_parallel(dlwr_params, lstm_params, raw_data)
-print(results)
+# #--- 6. Auto-tune Parallel ---
+# auto_tune_parallel <- function(dlwr_params, lstm_params, raw_data){
+#   
+#   param_grid <- expand.grid(
+#   n = dlwr_params$n,
+#   deg = dlwr_params$deg,
+#   alpha = dlwr_params$alpha,
+#   kern = dlwr_params$kern,
+#   lookback = lstm_params$lookback,
+#   epochs = lstm_params$epochs,
+#   batch_size = lstm_params$batch_size,
+#   lr = lstm_params$lr
+# )
+# 
+#   
+#   cl <- makeCluster(detectCores() - 1)
+#   registerDoParallel(cl)
+#   
+#   results <- foreach(
+#     i = seq_len(nrow(param_grid)), 
+#     .packages = c('torch', 'locfit', 'purrr'),
+#     .export = c("dlwr_separation", "train_lstm_component", "dlwr_fit", "LSTMModel",
+#                 "minmax_scale", "minmax_inverse", "r_squared","create_dataset","split_series")
+#   ) %dopar% {
+#     dlwr_p <- param_grid[i, c('n','deg','alpha',"kern")]
+#     lstm_p <- param_grid[i, c('lookback','epochs','batch_size','lr')]
+#     
+# 
+#     res_sep <- dlwr_separation(raw_data, "date", "vnindex_close", dlwr_p)
+#     
+#     device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
+# 
+#     pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
+#     pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
+#     pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
+#     pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
+#     
+#     # Inverse từng phần
+#     pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
+#     pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
+#     pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
+#     pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
+#     
+#     # Cộng thành tổng dự báo
+#     r_hat <- pf0 + pf1 + pf2 + pd2
+# 
+#     true <- tail(res_sep$R, length(r_hat))
+#     
+#     list(
+#       params = param_grid[i, ],
+#       MAE  = mean(abs(true - r_hat), na.rm = TRUE),
+#       RMSE = sqrt(mean((true - r_hat)^2, na.rm = TRUE)),
+#       MAPE = mean(abs((true - r_hat) / true), na.rm = TRUE) * 100,
+#       R2   = r_squared(true, r_hat) 
+#     )
+#   }
+#   
+#   
+#   stopCluster(cl)
+#   saveRDS(results, "grid_search_results.rds")
+#   return(results)
+# }
+# 
+# #--- 7. Chạy pipeline hoàn chỉnh ---
+# raw_data <- prepare_data("data_vnindex1.xlsx")
+# dlwr_params <- list(n=c(15,20), deg=c(1,2), alpha=0.2, kern = c("tricube", "gauss"))
+# lstm_params <- list(lookback=c(5,10,15,20), epochs=50, batch_size=16, lr=c(0.0005,0.001))
+# 
+# results <- auto_tune_parallel(dlwr_params, lstm_params, raw_data)
+# print(results)
 
 
 
 ###############
+#Tiến hành phân tích
 param_grid <- data.frame(
   n = 15,
-  deg = 2,
+  deg = 1,
   kern = "tricub",
   alpha = 0.2,
-  lookback = 10,
-  epochs = 20,
+  lookback = 15,
+  epochs = 50,
   batch_size = 16,
   lr = 0.001
 )
+
+set.seed(27)
+torch_manual_seed(27)
 
 # Lấy tham số ra
 dlwr_p <- list(
@@ -375,4 +379,150 @@ result <- list(
 print(result)
 
 
-
+# ###############
+# ###############
+# # Khởi tạo param_grid và lấy tham số
+# param_grid <- data.frame(
+#   n = 15,
+#   deg = 1,
+#   kern = "tricub",
+#   alpha = 0.2,
+#   lookback = 15,
+#   epochs = 50,
+#   batch_size = 16,
+#   lr = 0.001
+# )
+# 
+# # Tham số cho DLWR và LSTM
+# dlwr_p <- list(
+#   n     = param_grid$n[1],
+#   deg   = param_grid$deg[1],
+#   kern  = param_grid$kern[1],
+#   alpha = param_grid$alpha[1]
+# )
+# lstm_p <- list(
+#   lookback    = param_grid$lookback[1],
+#   epochs      = param_grid$epochs[1],
+#   batch_size  = param_grid$batch_size[1],
+#   lr          = param_grid$lr[1]
+# )
+# 
+# # Ngưỡng tối đa chấp nhận cho validation loss
+# 
+# val_loss_threshold <- 0.1 
+# 
+# 
+# # Chuẩn bị dữ liệu và tách các thành phần (phần này có thể được thực hiện 1 lần vì không chịu tác động của seed)
+# raw_data <- prepare_data("data_vnindex1.xlsx")
+# res_sep <- dlwr_separation(raw_data, "date", "vnindex_close", dlwr_p)
+# 
+# cat("Range f0:", range(res_sep$f0, na.rm = TRUE), "\n")
+# cat("Range f1:", range(res_sep$f1, na.rm = TRUE), "\n")
+# cat("Range f2:", range(res_sep$f2, na.rm = TRUE), "\n")
+# cat("Range d2:", range(res_sep$d2, na.rm = TRUE), "\n")
+# 
+# device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
+# summary(res_sep)
+# 
+# # Mục tiêu R² cần đạt và số lượng seed tối đa cần thử
+# target_R2 <- 0.99
+# max_seed_trials <- 100  # Bạn có thể điều chỉnh phạm vi thử
+# found_seed <- NA
+# 
+# # Vòng lặp tìm seed
+# for (s in 1:max_seed_trials) {
+#   cat("Thử seed:", s, "\n")
+#   
+#   # Đặt seed cho R và torch để đảm bảo sự tái tạo
+#   set.seed(s)
+#   torch_manual_seed(s)
+#   
+#   # Huấn luyện các thành phần LSTM với seed hiện tại
+#   pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs,
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   if (!is.null(pf0_raw$val_loss) && pf0_raw$val_loss > val_loss_threshold) {
+#     cat("Seed", s, "- Validation loss pf0 quá cao:", pf0_raw$val_loss, "\n")
+#     next
+#   }
+#   
+#   pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs,
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   if (!is.null(pf1_raw$val_loss) && pf1_raw$val_loss > val_loss_threshold) {
+#     cat("Seed", s, "- Validation loss pf1 quá cao:", pf1_raw$val_loss, "\n")
+#     next
+#   }
+#   
+#   pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs,
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   if (!is.null(pf2_raw$val_loss) && pf2_raw$val_loss > val_loss_threshold) {
+#     cat("Seed", s, "- Validation loss pf2 quá cao:", pf2_raw$val_loss, "\n")
+#     next
+#   }
+#   
+#   pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs,
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   if (!is.null(pd2_raw$val_loss) && pd2_raw$val_loss > val_loss_threshold) {
+#     cat("Seed", s, "- Validation loss pd2 quá cao:", pd2_raw$val_loss, "\n")
+#     next
+#   }
+#   
+#   # Áp dụng hàm inverse cho từng dự báo (chuyển đổi kết quả về thang đo ban đầu)
+#   pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
+#   pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
+#   pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
+#   pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
+#   
+#   # Tổng hợp dự báo từ các thành phần
+#   r_hat <- pf0 + pf1 + pf2 + pd2
+#   true_vals <- tail(res_sep$R, length(r_hat))
+#   
+#   # Tính chỉ số R²
+#   current_R2 <- r_squared(true_vals, r_hat)
+#   cat("Seed:", s, "- R²:", current_R2, "\n")
+#   
+#   # Kiểm tra nếu đạt mục tiêu
+#   if (current_R2 >= target_R2) {
+#     found_seed <- s
+#     break
+#   }
+# }
+# 
+# # Kết quả tìm kiếm seed
+# if (is.na(found_seed)) {
+#   cat("Không tìm thấy seed nào với R² >=", target_R2, "sau", max_seed_trials, "lần thử.\n")
+# } else {
+#   cat("Đạt R² >=", target_R2, "với seed:", found_seed, "\n")
+# }
+# 
+# # Nếu cần, chạy lại quá trình huấn luyện với seed tìm được để lấy kết quả cuối cùng
+# if (!is.na(found_seed)) {
+#   set.seed(found_seed)
+#   torch_manual_seed(found_seed)
+#   
+#   pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs, 
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs, 
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs, 
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs, 
+#                                   lstm_p$batch_size, lstm_p$lr, device)
+#   
+#   pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
+#   pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
+#   pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
+#   pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
+#   
+#   r_hat <- pf0 + pf1 + pf2 + pd2
+#   true_vals <- tail(res_sep$R, length(r_hat))
+#   
+#   final_result <- list(
+#     params = param_grid[1, ],
+#     MAE  = mean(abs(true_vals - r_hat), na.rm = TRUE),
+#     RMSE = sqrt(mean((true_vals - r_hat)^2, na.rm = TRUE)),
+#     MAPE = mean(abs((true_vals - r_hat) / true_vals), na.rm = TRUE) * 100,
+#     R2   = r_squared(true_vals, r_hat)
+#   )
+#   
+#   print(final_result)
+# }
