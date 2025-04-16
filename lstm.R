@@ -7,7 +7,7 @@ for (pkg in packages) {
   if (!(pkg %in% installed)) install.packages(pkg)
   library(pkg, character.only = TRUE)
 }
-tf <- tensorflow::tf
+# tf <- tensorflow::tf
 #use_python("C:/Users/quanp/AppData/Local/Programs/Python/Python312/python.exe", required = TRUE)
 
 # Nếu bạn đã cài Python và tensorflow từ trước, có thể khai báo rõ:
@@ -112,6 +112,47 @@ for (name in names(models)[-1]) {
   level <- exp(cumsum(mu_drift_adj)) * last_train_value
   results[[name]] <- level
 }
+
+r_squared <- function(y_true, y_pred) {
+  ss_res <- sum((y_true - y_pred)^2, na.rm = TRUE)
+  ss_tot <- sum((y_true - mean(y_true, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res / ss_tot
+}
+
+mape <- function(y_true, y_pred) {
+  mean(abs((y_true - y_pred) / y_true), na.rm = TRUE) * 100
+}
+
+rmse <- function(y_true, y_pred) {
+  sqrt(mean((y_true - y_pred)^2, na.rm = TRUE))
+}
+
+mae <- function(y_true, y_pred) {
+  mean(abs(y_true - y_pred), na.rm = TRUE)
+}
+
+metrics <- data.frame(
+  Model = character(),
+  R2 = numeric(),
+  MAPE = numeric(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (name in names(results)) {
+  pred <- results[[name]]
+  actual_trimmed <- actual[1:length(pred)]  # đảm bảo cùng chiều dài
+  
+  metrics <- rbind(metrics, data.frame(
+    Model = name,
+    R2    = r_squared(actual_trimmed, pred),
+    MAPE  = mape(actual_trimmed, pred),
+    RMSE  = rmse(actual_trimmed, pred),
+    MAE   = mae(actual_trimmed, pred)
+  ))
+}
+
 
 ###########################
 # 7. Xây và huấn luyện mô hình LSTM (nếu khả dụng)
