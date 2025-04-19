@@ -13,8 +13,8 @@ data$date <- as.Date(data$date)
 data <- data[order(data$date), ]
 data_xts <- xts(data[, setdiff(names(data), "date")], order.by = data$date)
 
-# 3. Chia dữ liệu thành tập huấn luyện và kiểm tra theo số dòng
-n <- 60  # số ngày cuối dùng làm test
+# 3. Chia dữ liệu thành tập huấn luyện và kiểm tra
+n <- 90  # số ngày cuối dùng làm test
 total_rows <- nrow(data_xts)
 
 training_data <- data_xts[1:(total_rows - n), ]
@@ -26,6 +26,9 @@ log_return_train <- na.omit(log_return_train)
 
 log_return_test <- diff(log(test_data$vnindex_close))
 log_return_test <- na.omit(log_return_test)
+
+# Giá cuối cùng của tập huấn luyện (điểm khởi đầu tính giá)
+P0 <- as.numeric(tail(training_data$vnindex_close, 1))
 
 cat("\n--- Kiểm định tính dừng ---\n")
 cat("ADF test:\n")
@@ -73,13 +76,15 @@ models <- list(
   ARIMA_GJR_GARCH = spec_arima_gjr
 )
 
-results <- list()
+log_return_preds <- list()
+price_preds <- list()
 
-# ARIMA dự báo log-return
+# ARIMA: dự báo log-return rồi chuyển sang giá
 forecast_arima <- forecast(models$ARIMA, h = forecast_horizon)
-results[["ARIMA"]] <- as.numeric(forecast_arima$mean)
+log_return_preds[["ARIMA"]] <- as.numeric(forecast_arima$mean)
+price_preds[["ARIMA"]] <- exp(cumsum(log_return_preds[["ARIMA"]])) * P0
 
-# Dự báo GARCH-type models
+# GARCH-type models rolling forecast
 for (name in names(models)[-1]) {
   cat("Running model:", name, "\n")
   roll <- ugarchroll(
@@ -92,8 +97,12 @@ for (name in names(models)[-1]) {
     solver = "hybrid"
   )
   mu <- as.numeric(roll@forecast$density[,"Mu"])
-  results[[name]] <- mu
+  log_return_preds[[name]] <- mu
+  price_preds[[name]] <- exp(cumsum(mu)) * P0
 }
+
+# Tính lại giá thực tế từ log-return test
+actual_price <- exp(cumsum(as.numeric(log_return_test))) * P0
 
 # Hàm đánh giá
 r_squared <- function(y_true, y_pred) {
@@ -103,7 +112,6 @@ r_squared <- function(y_true, y_pred) {
 }
 
 mape <- function(y_true, y_pred) {
-  # Tránh chia cho 0
   eps <- 1e-6
   denominator <- ifelse(abs(y_true) < eps, eps, y_true)
   mean(abs((y_true - y_pred) / denominator), na.rm = TRUE) * 100
@@ -117,7 +125,7 @@ mae <- function(y_true, y_pred) {
   mean(abs(y_true - y_pred), na.rm = TRUE)
 }
 
-# 7. Đánh giá mô hình
+# 7. Đánh giá mô hình dựa trên giá
 metrics <- data.frame(
   Model = character(),
   R2 = numeric(),
@@ -127,17 +135,18 @@ metrics <- data.frame(
   stringsAsFactors = FALSE
 )
 
-for (name in names(results)) {
-  pred <- results[[name]]
-  actual_trimmed <- log_return_test[1:length(pred)]
+for (name in names(price_preds)) {
+  pred_price <- price_preds[[name]]
+  actual_trimmed <- actual_price[1:length(pred_price)]
   
   metrics <- rbind(metrics, data.frame(
     Model = name,
-    R2    = r_squared(actual_trimmed, pred),
-    MAPE  = mape(actual_trimmed, pred),
-    RMSE  = rmse(actual_trimmed, pred),
-    MAE   = mae(actual_trimmed, pred)
+    R2    = r_squared(actual_trimmed, pred_price),
+    MAPE  = mape(actual_trimmed, pred_price),
+    RMSE  = rmse(actual_trimmed, pred_price),
+    MAE   = mae(actual_trimmed, pred_price)
   ))
 }
 
 print(metrics)
+
