@@ -1,5 +1,5 @@
 #--- 1. Load thư viện ---
-libs <- c("readxl",  "torch", "locfit", "purrr", "doParallel", "foreach")
+libs <- c("readxl",  "torch", "locfit", "purrr", "doParallel", "foreach","dplyr","tibble")
 
 # Kiểm tra và cài đặt nếu thiếu
 missing_libs <- setdiff(libs, installed.packages()[,"Package"])
@@ -24,7 +24,13 @@ prepare_data <- function(filepath){
 #--- 3. Các hàm chức năng
 
 #Hàm DLWR_Fit: tính hồi quy cục bộ động có trọng số cho chuỗi thời gian
-dlwr_fit <- function(x, y, n, deg = 1, alpha = 0.3, kern = "gauss", maxit = 30, start_t = 1){
+dlwr_fit <- function(x, y, n, deg = 1, alpha = 0.3, kern = "tricube", maxit = 30, start_t = 1){
+  
+  valid_kerns <- c("tricube","gauss","epanech")
+  if (!kern %in% valid_kerns)
+    stop(sprintf("kern = '%s' không hợp lệ; chọn một trong: %s",
+                 kern, paste(valid_kerns, collapse = ", ")))
+  
   N <- length(x)
   y_fitted <- rep(NA, N)
   
@@ -66,15 +72,31 @@ dlwr_separation <- function(data, date_col, value_col, params){
   R <- data[[value_col]]
   
   # Vòng 1: start_t = 1
-  f0 <- dlwr_fit(x, R, params$n, params$deg, params$alpha, start_t=1)
+  f0 <- dlwr_fit(x, R,
+                 n     = params$n,
+                 deg   = params$deg,
+                 alpha = params$alpha,
+                 kern  = params$kern,
+                 start_t = 1)
   d0 <- R - f0
   
   # Vòng 2: start_t = 2*n - 1
-  f1 <- dlwr_fit(x, d0, params$n, params$deg, params$alpha, start_t=2*params$n - 1)
+  f1 <- dlwr_fit(x, d0,
+                 n     = params$n,
+                 deg   = params$deg,
+                 alpha = params$alpha,
+                 kern  = params$kern,
+                 start_t = 2*params$n - 1)
   d1 <- d0 - f1
   
   # Vòng 3: start_t = 3*n - 2
-  f2 <- dlwr_fit(x, d1, params$n, params$deg, params$alpha, start_t=3*params$n - 2)
+  f2 <- dlwr_fit(x, d1,
+                 n     = params$n,
+                 deg   = params$deg,
+                 alpha = params$alpha,
+                 kern  = params$kern,
+                 start_t = 3*params$n - 2)
+  #Phần dư thể hiện nhiễu trắng
   d2 <- d1 - f2
   
   cut_idx <- 3 * params$n - 3
@@ -97,432 +119,468 @@ minmax_inverse <- function(scaled_x, min_val, max_val) {
   scaled_x * (max_val - min_val) + min_val
 }  
 
-#tạo bộ dữ liệu phù hợp cho deep learning
-create_dataset <- function(series, lookback){
-  
-  series_tensor <- torch_tensor(series, dtype = torch_float())
-  series_tensor <- series_tensor$to(device = device)
-  X <- lapply(1:(length(series_tensor)-lookback), function(i) series_tensor[i:(i+lookback-1)]$unsqueeze(2))
-  Y <- series_tensor[(lookback+1):length(series_tensor)]
-  list(x = torch_stack(X), y = Y)
-}
-
-#Chia thành tập train/test/validation
-split_series <- function(series, train_ratio = 0.6, val_ratio = 0.1) {
+# Chia series thành train, validation, test
+split_series <- function(series, test_days = 65, val_ratio = 0.1) {
   N <- length(series)
-  idx_train <- floor(N * train_ratio)
-  idx_val   <- floor(N * val_ratio)
   
-  if ((idx_train + idx_val) >= N) {
-    stop("Tập dữ liệu quá ngắn để tách thành train/val/test theo tỷ lệ đã cho.")
+  if (test_days >= N) {
+    stop("Số ngày test lớn hơn hoặc bằng độ dài chuỗi.")
+  }
+  
+  # Tập train+val là phần còn lại
+  train_val_end <- N - test_days
+  idx_val <- floor(train_val_end * val_ratio)
+  
+  if (idx_val >= train_val_end) {
+    stop("Tập validation quá lớn so với tập train.")
   }
   
   list(
-    train = series[1:idx_train],
-    val   = series[(idx_train + 1):(idx_train + idx_val)],
-    test  = series[(idx_train + idx_val + 1):N]
+    train = series[1:(train_val_end - idx_val)],
+    val   = series[(train_val_end - idx_val + 1):train_val_end],
+    test  = series[(train_val_end + 1):N]
   )
 }
 
+#tạo bộ dữ liệu phù hợp cho deep learning
+create_dataset <- function(series, lookback, horizon = 1, device) {
+  # Ép về float và đưa lên device
+  ts <- torch_tensor(series, dtype = torch_float(), device = device)
+  n   <- ts$size()[1] - lookback - horizon + 1L
+  if (n <= 0) stop("Chuỗi quá ngắn cho lookback + horizon")
+  
+  X <- vector("list", n)
+  Y <- vector("list", n)
+  for (i in seq_len(n)) {
+    seq_x <- ts[i:(i + lookback - 1)]             # [lookback]
+    seq_y <- ts[(i + lookback):(i + lookback + horizon - 1)]  # [horizon]
+    X[[i]] <- seq_x$unsqueeze(2)                  # [lookback, 1]
+    Y[[i]] <- seq_y$unsqueeze(2)                  # [horizon, 1]
+  }
+  x_t <- torch_stack(X)                           # [batch, lookback, 1]
+  y_t <- torch_stack(Y)                           # [batch, horizon, 1]
+  # nếu bạn muốn y là [batch, horizon]:
+  y_t <- y_t$squeeze(3)
+  
+  list(x = x_t, y = y_t)
+}
+
+
+#Thiết kế module LSTM phù hợp
+LSTMModel <- nn_module(
+  "LSTMModel",
+  initialize = function(horizon = 1) {
+    self$horizon <- horizon
+    
+    self$lstm1 <- nn_lstm(input_size = 1, hidden_size = 64, batch_first = TRUE)
+    self$lstm2 <- nn_lstm(input_size = 64, hidden_size = 128, batch_first = TRUE)
+    self$lstm3 <- nn_lstm(input_size = 128, hidden_size = 128, batch_first = TRUE)
+    
+    self$fc1 <- nn_linear(128, 128)
+    self$dropout <- nn_dropout(0.2)
+    self$fc2 <- nn_linear(128, horizon)  # output multi-step
+  },
+  
+  forward = function(x) {
+    x <- self$lstm1(x)[[1]]
+    x <- self$lstm2(x)[[1]]
+    x <- self$lstm3(x)[[1]]
+    
+    x <- x[, dim(x)[2], ]  # lấy timestep cuối
+    x <- self$fc1(x)
+    x <- nnf_relu(x)       # ReLU sau fc1
+    x <- self$dropout(x)
+    x <- self$fc2(x)
+    x <- nnf_relu(x)       # ReLU sau fc2
+    x
+  }
+)
+
+
 
 #Tính chỉ tiêu đo lường hiệu quả mô hình: R^2
-r_squared <- function(y_true, y_pred) {
+r_squared <- function(y_true, y_pred, ref_mean = NULL) {
+  if (is.null(ref_mean)) ref_mean <- mean(y_true, na.rm = TRUE)  # mặc định cũ
   ss_res <- sum((y_true - y_pred)^2, na.rm = TRUE)
-  ss_tot <- sum((y_true - mean(y_true, na.rm = TRUE))^2, na.rm = TRUE)
+  ss_tot <- sum((y_true - ref_mean)^2, na.rm = TRUE)
   1 - ss_res / ss_tot
 }
 
 
 # Định nghĩa các thành phần cho học sâu: LSTM
-train_lstm_component <- function(series, lookback, epochs, batch_size, lr, device){
+train_lstm_component <- function(series,
+                                 lookback =10,
+                                 horizon          = 1,
+                                 epochs           = 20,
+                                 batch_size       = 16,
+                                 lr               = 1e-3,
+                                 device,
+                                 test_days = 65,
+                                 patience         = 10,
+                                 min_epochs       = 10,
+                                 val_loss_thres   = Inf,
+                                 restore_best     = TRUE,
+                                 hidden_size      = 128,
+                                 num_layers       = 2,
+                                 cell             = c("lstm","gru"),
+                                 verbose          = TRUE) {
   
-  print(paste("Check inputs: lookback =", lstm_p$lookback,
-              "epochs =", lstm_p$epochs,
-              "batch_size =", lstm_p$batch_size,
-              "lr =", lstm_p$lr))
-
-
+  stopifnot(length(series) > lookback + horizon)
   
-  # Kiểm tra độ dài chuỗi phải lớn hơn lookback
-  if(length(series) <= lookback){
-    warning("Chuỗi không đủ dữ liệu sau khi làm sạch.")
-    return(rep(NA, length(series)))
-  }
+  ## 1. scale & split
+  splits <- if (test_days > 0)
+    split_series(series, test_days = test_days, val_ratio = 0.1)
+  else
+    split_series(series, test_days = 0,           val_ratio = 0.1)
   
-  # Bước 2: MinMax normalization
-  scaled <- minmax_scale(series)
-  scaled_series <- scaled$scaled
-  min_val <- scaled$min
-  max_val <- scaled$max
-  
-  # Tách tập train/val/test
-  splits <- split_series(scaled_series, 0.6, 0.1)
+  # Lấy riêng train và val
   train <- splits$train
-  val <- splits$val
-  test <- splits$test
+  val   <- splits$val
+  test   <- splits$test 
   
-  ds_train <- create_dataset(train,lookback)
-  ds_val <- create_dataset(val,lookback)
-  ds_test <- create_dataset(test,lookback)
+  ## 2) Scale lần lượt train và val
+  sc       <- minmax_scale(train)        # <-- chỉ train
+  train_sc <- sc$scaled
+  val_sc   <- (val - sc$min) / (sc$max - sc$min)
+  
+  #stopifnot(min(length(train), length(val), length(test)) > lookback)
+  
+  ## 2. dataset & loader
+  ds_train <- create_dataset(train_sc, lookback, horizon, device)
+  ds_val   <- create_dataset(val_sc,   lookback, horizon, device)
+  hist_series <- c(train_sc, val_sc)  
+  
+  if (length(hist_series) < lookback + horizon)
+    stop("hist_series quá ngắn – giảm lookback hoặc bổ sung dữ liệu")
+  
+  ds_test  <- create_dataset(
+    hist_series[(length(hist_series) - lookback - horizon + 1) :
+                  length(hist_series)],        # ít nhất lookback+horizon điểm
+    lookback, horizon, device)
+  train_dl <- dataloader(tensor_dataset(ds_train$x, ds_train$y),
+                         batch_size, shuffle = TRUE)
+  val_dl   <- dataloader(tensor_dataset(ds_val$x, ds_val$y),
+                         batch_size)
   
   
-  # Dataloader
-  train_dl <- dataloader(tensor_dataset(ds_train$x, ds_train$y), batch_size=batch_size, shuffle=TRUE)
-  val_dl <- dataloader(tensor_dataset(ds_val$x, ds_val$y), batch_size=batch_size)
+  ## 3. model / optim
+  #model <- LSTMModel(horizon = horizon)$to(device = device, dtype = torch_float())
+  #model <- LSTMModel(horizon = horizon)$to(device, dtype = torch_float())
   
+  model <- LSTMModel(horizon = horizon)
+  model <- model$to(device = device)
   
-  model <- LSTMModel()$to(device=device)
-  optimizer <- optim_adam(model$parameters, lr = lr)
-  loss_fn <- nn_mse_loss()
+  opt       <- optim_adam(model$parameters, lr = lr)
+  loss_fn   <- nn_mse_loss()
   
-  model$train()
+  best_val  <- Inf; best_state <- NULL; wait <- 0
+  best_state  <- NULL
+  wait        <- 0
   
- for(epoch in seq_len(epochs)){
-    coro::loop(for(b in train_dl){
-      optimizer$zero_grad()
-      loss <- loss_fn(model(b[[1]])$squeeze(), b[[2]])
+  for (ep in seq_len(epochs)) {
+    
+    ### train
+    model$train()
+    coro::loop(for (b in train_dl) {
+      b <- lapply(b, function(t) t$to(device = device))
+      opt$zero_grad()
+      loss <- loss_fn(model(b[[1]]), b[[2]])
       loss$backward()
-      optimizer$step()
+      opt$step()
     })
+    
+    ### validate
+    model$eval()
+    vlosses <- c()
+    with_no_grad({
+      coro::loop(for (b in val_dl) {
+        b <- lapply(b, function(t) t$to(device = device))
+        
+        vlosses <- c(vlosses, as.numeric(loss_fn(model(b[[1]]), b[[2]])))
+      })
+    })
+    v <- mean(vlosses)
+    if (verbose) cat(sprintf("Epoch %d  val_loss = %.5g\n", ep, v))
+    
+    if (v < best_val - 1e-8) {
+      best_val <- v; best_state <- model$state_dict(); wait <- 0
+    } else wait <- wait + 1
+    
+    if (ep >= min_epochs && (best_val < val_loss_thres || wait >= patience))
+      break
   }
   
-  model$eval()
-  val_losses <- c()
+  if (restore_best) model$load_state_dict(best_state)
   
-  with_no_grad({
-    coro::loop(for (b in val_dl) {
-      output <- model(b[[1]])$squeeze()
-      loss <- loss_fn(output, b[[2]])
-      val_losses <- c(val_losses, as.numeric(loss))
-    })
-  })
+  ## 4. predict test
   
-  avg_val_loss <- mean(val_losses)
-  cat(sprintf("Epoch %d/%d | Validation Loss: %.4f\n", epoch, epochs, avg_val_loss))
- 
-
   model$eval()
   with_no_grad({
-  preds <- model(ds_test$x)$cpu()$squeeze()
+    preds_sc <- model(ds_test$x)$detach()  # [n_test, horizon]
   })
-    
-  preds <- as.numeric(preds)
-  summary(preds)
-  return(list(preds = preds, min = min_val, max = max_val, val_loss = avg_val_loss))
+  if (horizon == 1) {
+    # Trường hợp chỉ dự báo 1 bước: giữ dạng vector và inverse-scale trực tiếp
+    preds <- minmax_inverse(as.numeric(preds_sc), sc$min, sc$max)
+  } else {
+    # Nhiều bước: kết quả là ma trận, inverse-scale theo cột
+    preds <- apply(as.matrix(preds_sc), 2,
+                   minmax_inverse, sc$min, sc$max, simplify = TRUE)
+    # Bảo đảm vẫn là ma trận & gán tên cột
+    preds <- matrix(preds,
+                    ncol     = horizon,
+                    dimnames = list(NULL, paste0("t+", 1:horizon)))
+  }
+  
+  list(preds   = preds,          # matrix: [n_test, horizon]
+       val_loss = best_val,
+       scaler   = sc,
+       model_state = best_state)
 }
 
-#Thiết kế module LSTM phù hợp
-LSTMModel <- nn_module(
-  "LSTMModel",
-  initialize = function() {
-    self$lstm1 <- nn_lstm(input_size = 1, hidden_size = 64, batch_first = TRUE)
-    self$lstm2 <- nn_lstm(input_size = 64, hidden_size = 128, batch_first = TRUE)
-    self$lstm3 <- nn_lstm(input_size = 128, hidden_size = 128, batch_first = TRUE)
-    self$fc1 <- nn_linear(128, 128)
-    self$dropout <- nn_dropout(0.2)
-    self$fc2 <- nn_linear(128, 1)
-  },
-  forward = function(x) {
-    x <- self$lstm1(x)[[1]]
-    x <- self$lstm2(x)[[1]]
-    x <- self$lstm3(x)[[1]]
-    x <- x[ , dim(x)[2], ] # Lấy timestep cuối cùng
-    x <- self$fc1(x)
-    x <- nnf_relu(x)
-    x <- self$dropout(x)
-    x <- self$fc2(x)
-    x <- nnf_relu(x)
+predict_dlwr_lstm <- function(series,
+                              dlwr_par  = list(n = 15, deg = 1, alpha = 0.2,
+                                               kern = "tricube"),
+                              lstm_par  = list(lookback = 15, epochs = 50,
+                                               batch_size = 16, lr = 1e-3),
+                              seed      = 26,
+                              test_days = 65,
+                              val_ratio = 0.2,
+                              verbose   = TRUE) {
+  
+  ## --- 0. chuẩn bị ---------------------------------------------------------
+  stopifnot(is.numeric(series), length(series) > dlwr_par$n * 3)
+  if (verbose) cat("Series length:", length(series), "\n")
+  
+  set.seed(seed); torch_manual_seed(seed)
+  device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
+  
+  ## --- 1. phân rã DLWR -----------------------------------------------------
+  df     <- data.frame(date = seq_along(series), close = series)
+  res    <- dlwr_separation(df, "date", "close", dlwr_par)
+  
+  # 2) Tách chỉ để giữ y_true cuối cùng
+  splits_full <- split_series(res$R, test_days = test_days, val_ratio = val_ratio)
+  y_true <- splits_full$test
+  
+  # 3) Recursive forecast helper: 
+  #    - Huấn luyện trên train+val (toàn phần trước test)
+  #    - Lặp test_days lần: mỗi lần predict 1 bước, append vào input
+  forecast_comp <- function(comp_vec) {
+    # split train+val
+    trval <- head(comp_vec, length(comp_vec) - test_days)
+    #c     <- minmax_scale(trval)
+    #sc_ts  <- sc$scaled
+    
+    # train LSTM trên toàn trval
+    out <- train_lstm_component(
+      series     = trval,
+      lookback   = lstm_par$lookback,
+      epochs     = lstm_par$epochs,
+      batch_size = lstm_par$batch_size,
+      lr         = lstm_par$lr,
+      device     = device,
+      test_days   = 0,
+      verbose    = FALSE
+    )
+    model_state <- out$model_state
+    scaler      <- out$scaler
+    
+    # rebuild model and load best weights
+    model <- LSTMModel(horizon = 1)
+    model <- model$to(device = device)
+    model$load_state_dict(model_state)
+    model$eval()
+    
+    # bắt đầu recursive
+    hist_scaled <- torch_tensor(
+      (trval - scaler$min) / (scaler$max - scaler$min),
+      dtype = torch_float())$to(device = device)
+    
+    preds <- numeric(test_days)
+    
+    for (t in seq_len(test_days)) {
+      # lấy lookback cuối cùng
+      input_seq <- hist_scaled[(length(hist_scaled) - lstm_par$lookback + 1):length(hist_scaled)]
+      input_seq <- input_seq$unsqueeze(1)$unsqueeze(3)  # [1, lookback, 1]
+      
+      with_no_grad({
+        out_t <- model(input_seq)$squeeze() |> as.numeric()
+      })
+      # inverse scale
+      pred_t <- scaler$min + out_t * (scaler$max - scaler$min)
+      preds[t] <- pred_t
+      
+      # append vào hist_scaled for next step
+      new_scaled <- (pred_t - scaler$min) / (scaler$max - scaler$min)
+      hist_scaled <- torch_cat(list(hist_scaled, torch_tensor(new_scaled)$to(device=device)), dim = 1)
+    }
+    #preds <- minmax_inverse(preds, scaler$min, scaler$max)
+    preds
   }
-)
+  
+  # 4) Forecast 4 thành phần
+  pf0 <- forecast_comp(res$f0)
+  pf1 <- forecast_comp(res$f1)
+  pf2 <- forecast_comp(res$f2)
+  pd2 <- forecast_comp(res$d2)
+  
+  
+  comp_list  <- list(pf0 = pf0, pf1 = pf1, pf2 = pf2, pd2 = pd2)
+  lens       <- sapply(comp_list, length)
+  n_na       <- sapply(comp_list, function(x) sum(is.na(x)))
+  
+  cat("Chiều dài: ", paste(names(lens), lens,  sep = "=", collapse = ", "), "\n")
+  cat("NA       : ", paste(names(n_na),  n_na,  sep = "=", collapse = ", "), "\n")
+  
+  stopifnot(all(lens == test_days) && all(n_na == 0))
+  
+  # 5) Ghép lại và tính metrics
+  stopifnot(length(pf0) == length(pf1),
+            length(pf1) == length(pf2),
+            length(pf2) == length(pd2),
+            length(pf0) == test_days)
+  
+  y_pred <- pf0 + pf1 + pf2 + pd2
+  print(paste0("y_pred =",y_pred,"; y_true = ", y_true))
+  MAE  <- mean(abs(y_true - y_pred))
+  RMSE <- sqrt(mean((y_true - y_pred)^2))
+  MAPE <- mean(abs((y_true - y_pred) / y_true)) * 100
+  mean_train <- mean(head(res$R, length(res$R) - test_days), na.rm = TRUE)
+  R2   <- r_squared(y_true, y_pred, mean_train)
+  
+  metrics_vec <- c(MAE = MAE,
+                   RMSE = RMSE,
+                   MAPE = MAPE,
+                   R2   = R2)
+  
+  list(seed    = seed,
+       metrics = metrics_vec,
+       y_true  = y_true,
+       y_pred  = y_pred)
+}
 
 
-# #--- 6. Auto-tune Parallel ---
-# auto_tune_parallel <- function(dlwr_params, lstm_params, raw_data){
-#   
-#   param_grid <- expand.grid(
-#   n = dlwr_params$n,
-#   deg = dlwr_params$deg,
-#   alpha = dlwr_params$alpha,
-#   kern = dlwr_params$kern,
-#   lookback = lstm_params$lookback,
-#   epochs = lstm_params$epochs,
-#   batch_size = lstm_params$batch_size,
-#   lr = lstm_params$lr
-# )
-# 
-#   
-#   cl <- makeCluster(detectCores() - 1)
-#   registerDoParallel(cl)
-#   
-#   results <- foreach(
-#     i = seq_len(nrow(param_grid)), 
-#     .packages = c('torch', 'locfit', 'purrr'),
-#     .export = c("dlwr_separation", "train_lstm_component", "dlwr_fit", "LSTMModel",
-#                 "minmax_scale", "minmax_inverse", "r_squared","create_dataset","split_series")
-#   ) %dopar% {
-#     dlwr_p <- param_grid[i, c('n','deg','alpha',"kern")]
-#     lstm_p <- param_grid[i, c('lookback','epochs','batch_size','lr')]
-#     
-# 
-#     res_sep <- dlwr_separation(raw_data, "date", "vnindex_close", dlwr_p)
-#     
-#     device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
-# 
-#     pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-#     pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-#     pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-#     pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-#     
-#     # Inverse từng phần
-#     pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
-#     pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
-#     pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
-#     pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
-#     
-#     # Cộng thành tổng dự báo
-#     r_hat <- pf0 + pf1 + pf2 + pd2
-# 
-#     true <- tail(res_sep$R, length(r_hat))
-#     
-#     list(
-#       params = param_grid[i, ],
-#       MAE  = mean(abs(true - r_hat), na.rm = TRUE),
-#       RMSE = sqrt(mean((true - r_hat)^2, na.rm = TRUE)),
-#       MAPE = mean(abs((true - r_hat) / true), na.rm = TRUE) * 100,
-#       R2   = r_squared(true, r_hat) 
-#     )
-#   }
-#   
-#   
-#   stopCluster(cl)
-#   saveRDS(results, "grid_search_results.rds")
-#   return(results)
-# }
-# 
-# #--- 7. Chạy pipeline hoàn chỉnh ---
-# raw_data <- prepare_data("data_vnindex1.xlsx")
-# dlwr_params <- list(n=c(15,20), deg=c(1,2), alpha=0.2, kern = c("tricube", "gauss"))
-# lstm_params <- list(lookback=c(5,10,15,20), epochs=50, batch_size=16, lr=c(0.0005,0.001))
-# 
-# results <- auto_tune_parallel(dlwr_params, lstm_params, raw_data)
-# print(results)
+#--- 6. Auto-tune Parallel ---
+auto_tune_serial_gpu <- function(dlwr_params, lstm_params, series,
+                                 n_seeds = 50) {
+  # 1) Tạo các grid
+  dlwr_grid <- expand.grid(
+    n     = dlwr_params$n,
+    deg   = dlwr_params$deg,
+    kern  = dlwr_params$kern,
+    alpha = dlwr_params$alpha,
+    stringsAsFactors = FALSE
+  )
+  lstm_grid <- expand.grid(
+    lookback   = lstm_params$lookback_grid,
+    epochs     = lstm_params$epochs_grid,
+    batch_size = lstm_params$batch_size_grid,
+    lr         = lstm_params$lr_grid,
+    stringsAsFactors = FALSE
+  )
+  combos <- merge(dlwr_grid, lstm_grid)
+  
+  # 2) Chọn device
+  device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
+  cat("Using device:", device$type, "\n")
+  
+  results <- list()
+  idx <- 1L
+  
+  # 3) Duyệt qua từng tổ hợp
+  for (i in seq_len(nrow(combos))) {
+    hp <- combos[i, ]
+    dlwr_p <- as.list(hp[c("n","deg","alpha","kern")])
+    lstm_p <- as.list(hp[c("lookback","epochs","batch_size","lr")])
+    
+    # 3.1. Phân rã bằng DLWR
+    sep <- dlwr_separation(
+      data      = data.frame(date = seq_along(series), close = series),
+      date_col  = "date",
+      value_col = "close",
+      params    = dlwr_p
+    )
+    if (nrow(sep) <= 65) {
+      message("→ Sep còn ", nrow(sep), " (<65) – bỏ combo này")
+      next                       # bỏ qua tổ hợp HP hiện tại
+    }
+    
+    cat(sprintf(
+      "Combo %d/%d  DLWR(n=%d,deg=%d,kern=%s,α=%.2f)  LSTM(lb=%d,ep=%d,bs=%d,lr=%g)\n",
+      i, nrow(combos),
+      hp$n, hp$deg, hp$kern, hp$alpha,
+      hp$lookback, hp$epochs, hp$batch_size, hp$lr
+    ))
+    
+    # 3.2. Duyệt seed
+    set.seed(123)
+    seed_vec <- sample.int(100, n_seeds)
+    
+    for (sd in seed_vec) {#seq_len(lstm_params$n_jobs * 0 + 50)) {  # 50 seeds
+      
+      out <- predict_dlwr_lstm(
+        series    = series,
+        dlwr_par  = dlwr_p,
+        lstm_par  = lstm_p,
+        seed      = sd,
+        test_days = lstm_params$test_days %||% 65,
+        verbose   = FALSE
+      )
+      
+      print(out$metrics)
+      
+      R2 <- unname(out$metrics["R2"])      # hoặc as.numeric(...)
+      
+      target_R2 <- lstm_params$target_R2 %||% 0.1 
+      
+      if (!is.na(R2) && (R2 >= target_R2)) {
+        results[[idx]] <- tibble::tibble(
+          seed       = sd,
+          n          = hp$n,
+          deg        = hp$deg,
+          kern       = hp$kern,
+          lookback   = hp$lookback,
+          epochs     = hp$epochs,
+          batch_size = hp$batch_size,
+          lr         = hp$lr,
+          MAE        = out$metrics["MAE"],
+          RMSE       = out$metrics["RMSE"],
+          MAPE       = out$metrics["MAPE"],
+          R2         = out$metrics["R2"]
+        )
+        idx <- idx + 1L
+      }
+    }
+  }
+  
+  # 4) Collate & sort
+  final <- dplyr::bind_rows(results)
+  final %>%
+    arrange(desc(R2), MAPE, RMSE) %>%
+    dplyr::mutate(rank = dplyr::row_number())
+}
 
 
+#--- 7. Chạy pipeline hoàn chỉnh ---
 
-###############
-#Tiến hành phân tích
-param_grid <- data.frame(
-  n = 15,
-  deg = 1,
-  kern = "tricub",
-  alpha = 0.2,
-  lookback = 15,
-  epochs = 50,
-  batch_size = 16,
-  lr = 0.001
-)
-
-set.seed(27)
-torch_manual_seed(27)
-
-# Lấy tham số ra
-dlwr_p <- list(
-  n     = param_grid$n[1],
-  deg   = param_grid$deg[1],
-  kern  = param_grid$kern[1],
-  alpha = param_grid$alpha[1]
-)
-lstm_p <- list(
-  lookback    = param_grid$lookback[1],
-  epochs      = param_grid$epochs[1],
-  batch_size  = param_grid$batch_size[1],
-  lr          = param_grid$lr[1]
-)
-
-# Tạo tập DLWR
-raw_data <- prepare_data("data_vnindex1.xlsx")
-res_sep <- dlwr_separation(raw_data, "date", "vnindex_close", dlwr_p)
-cat("Range f0:", range(res_sep$f0, na.rm = TRUE), "\n")
-cat("Range f1:", range(res_sep$f1, na.rm = TRUE), "\n")
-cat("Range f2:", range(res_sep$f2, na.rm = TRUE), "\n")
-cat("Range d2:", range(res_sep$d2, na.rm = TRUE), "\n")
 device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
-summary(res_sep)
-# Dự báo từng thành phần (trả về list chứa preds, min, max)
-summary(res_sep$f1)
-summary(res_sep$d2)
-pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
-pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs, lstm_p$batch_size, lstm_p$lr, device)
- 
-
-# Inverse từng phần
-pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
-pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
-pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
-pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
-
-# Tổng hợp dự báo
-r_hat <- pf0 + pf1 + pf2 + pd2
-true <- tail(res_sep$R, length(r_hat))
-
-# Đánh giá
-result <- list(
-  params = param_grid[1, ],
-  MAE  = mean(abs(true - r_hat), na.rm = TRUE),
-  RMSE = sqrt(mean((true - r_hat)^2, na.rm = TRUE)),
-  MAPE = mean(abs((true - r_hat) / true), na.rm = TRUE) * 100,
-  R2   = r_squared(true, r_hat)
+dlwr_params <- list(n=c(10, 15, 20), deg=c(1,2), alpha=c(0.2,0.3), kern = "tricube")
+lstm_params <- list(
+  lookback_grid   = c(10,20,40),
+  epochs_grid     = c(20),
+  batch_size_grid = c(16),
+  lr_grid         = 0.0005,
+  patience             = 5,
+  restore_best_weights = TRUE,
+  device               = device,
+  verbose              = FALSE
 )
 
-print(result)
+raw_data <- prepare_data("data_vnindex1.xlsx")  
 
 
-# ###############
-# ###############
-# # Khởi tạo param_grid và lấy tham số
-# param_grid <- data.frame(
-#   n = 15,
-#   deg = 1,
-#   kern = "tricub",
-#   alpha = 0.2,
-#   lookback = 15,
-#   epochs = 50,
-#   batch_size = 16,
-#   lr = 0.001
-# )
-# 
-# # Tham số cho DLWR và LSTM
-# dlwr_p <- list(
-#   n     = param_grid$n[1],
-#   deg   = param_grid$deg[1],
-#   kern  = param_grid$kern[1],
-#   alpha = param_grid$alpha[1]
-# )
-# lstm_p <- list(
-#   lookback    = param_grid$lookback[1],
-#   epochs      = param_grid$epochs[1],
-#   batch_size  = param_grid$batch_size[1],
-#   lr          = param_grid$lr[1]
-# )
-# 
-# # Ngưỡng tối đa chấp nhận cho validation loss
-# 
-# val_loss_threshold <- 0.1 
-# 
-# 
-# # Chuẩn bị dữ liệu và tách các thành phần (phần này có thể được thực hiện 1 lần vì không chịu tác động của seed)
-# raw_data <- prepare_data("data_vnindex1.xlsx")
-# res_sep <- dlwr_separation(raw_data, "date", "vnindex_close", dlwr_p)
-# 
-# cat("Range f0:", range(res_sep$f0, na.rm = TRUE), "\n")
-# cat("Range f1:", range(res_sep$f1, na.rm = TRUE), "\n")
-# cat("Range f2:", range(res_sep$f2, na.rm = TRUE), "\n")
-# cat("Range d2:", range(res_sep$d2, na.rm = TRUE), "\n")
-# 
-# device <- torch_device(if (cuda_is_available()) "cuda" else "cpu")
-# summary(res_sep)
-# 
-# # Mục tiêu R² cần đạt và số lượng seed tối đa cần thử
-# target_R2 <- 0.99
-# max_seed_trials <- 100  # Bạn có thể điều chỉnh phạm vi thử
-# found_seed <- NA
-# 
-# # Vòng lặp tìm seed
-# for (s in 1:max_seed_trials) {
-#   cat("Thử seed:", s, "\n")
-#   
-#   # Đặt seed cho R và torch để đảm bảo sự tái tạo
-#   set.seed(s)
-#   torch_manual_seed(s)
-#   
-#   # Huấn luyện các thành phần LSTM với seed hiện tại
-#   pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs,
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   if (!is.null(pf0_raw$val_loss) && pf0_raw$val_loss > val_loss_threshold) {
-#     cat("Seed", s, "- Validation loss pf0 quá cao:", pf0_raw$val_loss, "\n")
-#     next
-#   }
-#   
-#   pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs,
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   if (!is.null(pf1_raw$val_loss) && pf1_raw$val_loss > val_loss_threshold) {
-#     cat("Seed", s, "- Validation loss pf1 quá cao:", pf1_raw$val_loss, "\n")
-#     next
-#   }
-#   
-#   pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs,
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   if (!is.null(pf2_raw$val_loss) && pf2_raw$val_loss > val_loss_threshold) {
-#     cat("Seed", s, "- Validation loss pf2 quá cao:", pf2_raw$val_loss, "\n")
-#     next
-#   }
-#   
-#   pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs,
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   if (!is.null(pd2_raw$val_loss) && pd2_raw$val_loss > val_loss_threshold) {
-#     cat("Seed", s, "- Validation loss pd2 quá cao:", pd2_raw$val_loss, "\n")
-#     next
-#   }
-#   
-#   # Áp dụng hàm inverse cho từng dự báo (chuyển đổi kết quả về thang đo ban đầu)
-#   pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
-#   pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
-#   pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
-#   pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
-#   
-#   # Tổng hợp dự báo từ các thành phần
-#   r_hat <- pf0 + pf1 + pf2 + pd2
-#   true_vals <- tail(res_sep$R, length(r_hat))
-#   
-#   # Tính chỉ số R²
-#   current_R2 <- r_squared(true_vals, r_hat)
-#   cat("Seed:", s, "- R²:", current_R2, "\n")
-#   
-#   # Kiểm tra nếu đạt mục tiêu
-#   if (current_R2 >= target_R2) {
-#     found_seed <- s
-#     break
-#   }
-# }
-# 
-# # Kết quả tìm kiếm seed
-# if (is.na(found_seed)) {
-#   cat("Không tìm thấy seed nào với R² >=", target_R2, "sau", max_seed_trials, "lần thử.\n")
-# } else {
-#   cat("Đạt R² >=", target_R2, "với seed:", found_seed, "\n")
-# }
-# 
-# # Nếu cần, chạy lại quá trình huấn luyện với seed tìm được để lấy kết quả cuối cùng
-# if (!is.na(found_seed)) {
-#   set.seed(found_seed)
-#   torch_manual_seed(found_seed)
-#   
-#   pf0_raw <- train_lstm_component(res_sep$f0, lstm_p$lookback, lstm_p$epochs, 
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   pf1_raw <- train_lstm_component(res_sep$f1, lstm_p$lookback, lstm_p$epochs, 
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   pf2_raw <- train_lstm_component(res_sep$f2, lstm_p$lookback, lstm_p$epochs, 
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   pd2_raw <- train_lstm_component(res_sep$d2, lstm_p$lookback, lstm_p$epochs, 
-#                                   lstm_p$batch_size, lstm_p$lr, device)
-#   
-#   pf0 <- minmax_inverse(pf0_raw$preds, pf0_raw$min, pf0_raw$max)
-#   pf1 <- minmax_inverse(pf1_raw$preds, pf1_raw$min, pf1_raw$max)
-#   pf2 <- minmax_inverse(pf2_raw$preds, pf2_raw$min, pf2_raw$max)
-#   pd2 <- minmax_inverse(pd2_raw$preds, pd2_raw$min, pd2_raw$max)
-#   
-#   r_hat <- pf0 + pf1 + pf2 + pd2
-#   true_vals <- tail(res_sep$R, length(r_hat))
-#   
-#   final_result <- list(
-#     params = param_grid[1, ],
-#     MAE  = mean(abs(true_vals - r_hat), na.rm = TRUE),
-#     RMSE = sqrt(mean((true_vals - r_hat)^2, na.rm = TRUE)),
-#     MAPE = mean(abs((true_vals - r_hat) / true_vals), na.rm = TRUE) * 100,
-#     R2   = r_squared(true_vals, r_hat)
-#   )
-#   
-#   print(final_result)
-# }
+results <- auto_tune_serial_gpu(dlwr_params, lstm_params,
+                                raw_data$vnindex_close,
+                                n_seeds = 10)
+
+print(results)
